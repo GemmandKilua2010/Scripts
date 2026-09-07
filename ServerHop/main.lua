@@ -6,24 +6,22 @@ local ServerHop = {}
 
 local CONFIG = {
     FileName = "server-hop-temp.json",
-    MaxPages = 5,
+    MaxPages = 8,
+    MaxResults = 100,
+    RequestDelay = 0.15,
 
-    Age = {
-        PointsPerMinute = 1,
-        MaxPoints = 120
+    Min = {
+        EmptySlotWeight = 3,
+        PlayerWeight = -4,
+        EmptyBonus = 40,
+        LowPlayerBonus = 25
     },
 
-    Players = {
-        PointsPerEmptySlot = 0.5,
-        MaxPoints = 50
-    },
-
-    Bonuses = {
-        EmptyServer = 25,
-        VeryLowPlayers = 15
-    },
-
-    VeryLowPlayerLimit = 3
+    Max = {
+        PlayerWeight = 8,
+        OccupancyWeight = 5,
+        FullnessBonus = 35
+    }
 }
 
 local PlaceId = game.PlaceId
@@ -31,41 +29,43 @@ local LocalPlayer = Players.LocalPlayer
 local CurrentJobId = game.JobId
 
 local Visited = {}
+local BlockedPlaces = {}
 
-local function loadVisited()
-    local success, result = pcall(function()
+local function loadData()
+    local success, data = pcall(function()
         if not isfile(CONFIG.FileName) then
             return {}
         end
 
-        return HttpService:JSONDecode(
-            readfile(CONFIG.FileName)
-        )
+        return HttpService:JSONDecode(readfile(CONFIG.FileName))
     end)
 
-    if success and type(result) == "table" then
-        Visited = result
-    else
-        Visited = {}
+    if success and type(data) == "table" then
+        Visited = data.Visited or {}
+        BlockedPlaces = data.BlockedPlaces or {}
     end
 
     Visited[CurrentJobId] = true
 end
 
-local function saveVisited()
+local function saveData()
     pcall(function()
         writefile(
             CONFIG.FileName,
-            HttpService:JSONEncode(Visited)
+            HttpService:JSONEncode({
+                Visited = Visited,
+                BlockedPlaces = BlockedPlaces
+            })
         )
     end)
 end
 
-local function getServers(cursor)
+local function request(cursor)
     local url =
         "https://games.roblox.com/v1/games/"
         .. PlaceId
-        .. "/servers/Public?sortOrder=Asc&limit=100"
+        .. "/servers/Public?sortOrder=Asc&limit="
+        .. CONFIG.MaxResults
 
     if cursor then
         url ..= "&cursor=" .. HttpService:UrlEncode(cursor)
@@ -90,22 +90,7 @@ local function getServers(cursor)
     return data
 end
 
-local function getServerAge(server)
-    if server.created then
-        local created = tonumber(server.created)
-
-        if created then
-            return math.max(
-                0,
-                os.time() - created
-            )
-        end
-    end
-
-    return 0
-end
-
-local function calculateScore(server)
+local function getScore(server, mode)
     local playing = tonumber(server.playing) or 0
     local maxPlayers = tonumber(server.maxPlayers) or 0
 
@@ -113,43 +98,38 @@ local function calculateScore(server)
         return -math.huge
     end
 
-    local freeSlots = math.max(
-        0,
-        maxPlayers - playing
-    )
+    local freeSlots = maxPlayers - playing
+    local occupancy = playing / maxPlayers
 
     local score = 0
 
-    score += math.min(
-        freeSlots * CONFIG.Players.PointsPerEmptySlot,
-        CONFIG.Players.MaxPoints
-    )
+    if mode == "Min" then
+        score += freeSlots * CONFIG.Min.EmptySlotWeight
+        score += playing * CONFIG.Min.PlayerWeight
 
-    if playing == 0 then
-        score += CONFIG.Bonuses.EmptyServer
-    elseif playing <= CONFIG.VeryLowPlayerLimit then
-        score += CONFIG.Bonuses.VeryLowPlayers
+        if playing == 0 then
+            score += CONFIG.Min.EmptyBonus
+        elseif playing <= 3 then
+            score += CONFIG.Min.LowPlayerBonus
+        end
+    elseif mode == "Max" then
+        score += playing * CONFIG.Max.PlayerWeight
+        score += occupancy * 100 * CONFIG.Max.OccupancyWeight
+
+        if playing == maxPlayers then
+            score += CONFIG.Max.FullnessBonus
+        end
     end
-
-    local ageSeconds = getServerAge(server)
-    local ageMinutes = ageSeconds / 60
-
-    score += math.min(
-        ageMinutes * CONFIG.Age.PointsPerMinute,
-        CONFIG.Age.MaxPoints
-    )
 
     return score
 end
 
-local function findBestServer()
-    local bestServer = nil
-    local bestScore = -math.huge
-
+local function collectServers()
+    local servers = {}
     local cursor = nil
 
     for page = 1, CONFIG.MaxPages do
-        local data = getServers(cursor)
+        local data = request(cursor)
 
         if not data then
             break
@@ -157,30 +137,21 @@ local function findBestServer()
 
         for _, server in ipairs(data.data or {}) do
             local id = server.id
-
             local playing = tonumber(server.playing) or 0
             local maxPlayers = tonumber(server.maxPlayers) or 0
 
-            local valid =
-                id
+            if id
                 and id ~= CurrentJobId
                 and not Visited[id]
-                and maxPlayers > playing
+                and not BlockedPlaces[PlaceId]
+                and maxPlayers > playing then
 
-            if valid then
-                local score = calculateScore(server)
-
-                if score > bestScore then
-                    bestScore = score
-
-                    bestServer = {
-                        Id = id,
-                        Playing = playing,
-                        MaxPlayers = maxPlayers,
-                        Score = score,
-                        Age = getServerAge(server)
-                    }
-                end
+                servers[#servers + 1] = {
+                    Id = id,
+                    Playing = playing,
+                    MaxPlayers = maxPlayers,
+                    FreeSlots = maxPlayers - playing
+                }
             end
         end
 
@@ -189,34 +160,48 @@ local function findBestServer()
         if not cursor then
             break
         end
+
+        task.wait(CONFIG.RequestDelay)
     end
 
-    return bestServer
+    return servers
 end
 
-function ServerHop:GetBestServer()
-    loadVisited()
+function ServerHop:GetList(mode)
+    loadData()
 
-    local server = findBestServer()
+    mode = tostring(mode or "Min")
 
-    return server
-end
-
-function ServerHop:Teleport()
-    if not LocalPlayer then
-        return false, "LocalPlayer não encontrado."
+    if mode ~= "Min" and mode ~= "Max" then
+        return {}
     end
 
-    loadVisited()
+    local servers = collectServers()
 
-    local server = findBestServer()
+    for _, server in ipairs(servers) do
+        server.Score = getScore(server, mode)
+    end
 
-    if not server then
+    table.sort(servers, function(a, b)
+        return a.Score > b.Score
+    end)
+
+    return servers
+end
+
+function ServerHop:Teleport(mode)
+    mode = tostring(mode or "Min")
+
+    local list = self:GetList(mode)
+
+    if #list == 0 then
         return false, "Nenhum servidor disponível."
     end
 
+    local server = list[1]
+
     Visited[server.Id] = true
-    saveVisited()
+    saveData()
 
     local success, err = pcall(function()
         TeleportService:TeleportToPlaceInstance(
@@ -231,6 +216,54 @@ function ServerHop:Teleport()
     end
 
     return true, server
+end
+
+function ServerHop:Delete(placeId)
+    placeId = tonumber(placeId)
+
+    if not placeId then
+        return false, "PlaceId inválido."
+    end
+
+    BlockedPlaces[placeId] = true
+    saveData()
+
+    return true
+end
+
+function ServerHop:ClearDelete(placeId)
+    placeId = tonumber(placeId)
+
+    if not placeId then
+        return false
+    end
+
+    BlockedPlaces[placeId] = nil
+    saveData()
+
+    return true
+end
+
+function ServerHop:ClearVisited()
+    Visited = {
+        [CurrentJobId] = true
+    }
+
+    saveData()
+
+    return true
+end
+
+function ServerHop:GetVisited()
+    loadData()
+
+    local result = {}
+
+    for jobId in pairs(Visited) do
+        result[#result + 1] = jobId
+    end
+
+    return result
 end
 
 return ServerHop
