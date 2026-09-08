@@ -26,6 +26,7 @@ function DiscordRPC:OpenInvite(Code)
             Body = HttpService:JSONEncode(body)
         })
     end)
+    setclipboard(Code)
     return success, response
 end
 
